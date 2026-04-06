@@ -14,10 +14,12 @@ WATCHLIST = {}
 SENT = set()
 
 session = requests.Session()
-session.headers.update({"User-Agent": "Mozilla/5.0"})
+session.headers.update({
+    "User-Agent": "Mozilla/5.0"
+})
 
 
-# ================= FLASK SERVER =================
+# ================= FLASK KEEP ALIVE =================
 @app.route("/")
 def home():
     return "Bot is running"
@@ -34,18 +36,31 @@ def send_telegram(msg):
         r = session.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
 
         if r.status_code != 200:
-            print("Telegram error:", r.text, flush=True)
+            print("Telegram error:", r.text[:200], flush=True)
 
     except Exception as e:
         print("Telegram exception:", e, flush=True)
 
 
-# ================= FETCH COINS =================
+# ================= SAFE COIN FETCH (FIXED) =================
 def get_coins():
     try:
         url = "https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=desc"
         r = session.get(url, timeout=10)
+
+        # 🔥 IMPORTANT FIX: validate response BEFORE JSON parsing
+        if r.status_code != 200:
+            print("API blocked (status):", r.status_code, flush=True)
+            return []
+
+        text = r.text.strip()
+
+        if not text or text.startswith("<"):
+            print("API returned non-JSON (blocked or HTML)", flush=True)
+            return []
+
         return r.json()
+
     except Exception as e:
         print("API error:", e, flush=True)
         return []
@@ -63,7 +78,6 @@ def get_chat(mint):
             return None
 
         match = re.search(r"https://pump\.fun/chat/[a-zA-Z0-9]+", r.text)
-
         if match:
             return match.group(0)
 
@@ -73,7 +87,7 @@ def get_chat(mint):
     return None
 
 
-# ================= VERIFY CHAT (ANTI FAKE) =================
+# ================= VERIFY CHAT =================
 def verify_chat(mint):
     first = get_chat(mint)
     if not first:
@@ -89,10 +103,10 @@ def verify_chat(mint):
     return None
 
 
-# ================= MAIN LOOP =================
+# ================= BOT LOOP =================
 def bot_loop():
     print("🔥 BOT LOOP STARTED", flush=True)
-    send_telegram("🚀 Pump.fun bot LIVE (chat-only mode)")
+    send_telegram("🚀 Pump.fun bot LIVE (stable mode)")
 
     while True:
         try:
@@ -111,13 +125,12 @@ def bot_loop():
                 # track new coins
                 if mint not in WATCHLIST:
                     WATCHLIST[mint] = now
-                    print(f"👀 New coin tracked: {name}", flush=True)
+                    print(f"👀 Tracking: {name}", flush=True)
 
-                # only keep 5-minute window
+                # 5 min window
                 if now - WATCHLIST[mint] > 300:
                     continue
 
-                # avoid duplicates
                 if mint in SENT:
                     continue
 
@@ -137,7 +150,7 @@ def bot_loop():
                     print(f"💬 SENT: {name}", flush=True)
                     send_telegram(msg)
 
-            time.sleep(6)
+            time.sleep(8)
 
         except Exception as e:
             print("Loop crash:", e, flush=True)
