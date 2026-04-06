@@ -4,15 +4,13 @@ import re
 from flask import Flask
 from threading import Thread
 
-# ================== CONFIG ==================
+# ===== CONFIG =====
 BOT_TOKEN = "8710292892:AAHGhAR_2xdkXba2wNclnyl5wOK_OjE38I4"
 CHAT_ID = "5578314612"
 
-# ============================================
-
 SEEN = set()
 
-# ===== KEEP ALIVE (FOR RENDER WEB SERVICE) =====
+# ===== KEEP ALIVE =====
 app = Flask(__name__)
 
 @app.route('/')
@@ -26,86 +24,93 @@ def keep_alive():
     t = Thread(target=run)
     t.start()
 
-# ==============================================
+# ===== TELEGRAM TEST =====
+def send_telegram(text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = {
+        "chat_id": CHAT_ID,
+        "text": text
+    }
 
-def get_new_coins():
-    url = "https://frontend-api.pump.fun/coins"
     try:
-        r = requests.get(url, timeout=10)
-        return r.json()
-    except:
+        r = requests.post(url, data=data)
+        print("Telegram response:", r.text)
+    except Exception as e:
+        print("Telegram error:", e)
+
+# ===== GET COINS =====
+def get_new_coins():
+    try:
+        r = requests.get("https://frontend-api.pump.fun/coins", timeout=10)
+        data = r.json()
+        print(f"Fetched {len(data)} coins")
+        return data
+    except Exception as e:
+        print("Error fetching coins:", e)
         return []
 
+# ===== GET CHAT =====
 def get_chat_link(ca):
     try:
         url = f"https://pump.fun/{ca}"
         r = requests.get(url, timeout=10)
 
-        if "pump.fun/chat/" in r.text:
-            match = re.search(r"(https://pump\.fun/chat/[a-zA-Z0-9]+)", r.text)
-            if match:
-                return match.group(1)
+        match = re.search(r"(https://pump\.fun/chat/[a-zA-Z0-9]+)", r.text)
+        if match:
+            return match.group(1)
 
-    except:
-        return None
+    except Exception as e:
+        print("Chat fetch error:", e)
 
     return None
 
-def send_telegram(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
-    data = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": "Markdown"
-    }
-
-    try:
-        requests.post(url, data=data)
-    except:
-        pass
-
+# ===== MAIN LOOP =====
 def main():
-    print("🔥 Scanning pump.fun for NEW coins with chats...")
+    print("🔥 BOT STARTED")
+
+    # 🔥 FORCE TEST MESSAGE
+    send_telegram("✅ Bot is LIVE and scanning!")
 
     while True:
         coins = get_new_coins()
 
-        print(f"Scanning {len(coins)} coins...")
-
         for coin in coins:
-            ca = coin.get("mint")
-            name = coin.get("name")
-            mc = coin.get("market_cap", 0)
+            try:
+                ca = coin.get("mint")
+                name = coin.get("name")
 
-            if not ca or ca in SEEN:
-                continue
+                print(f"Checking: {name} | {ca}")
 
-            SEEN.add(ca)
+                if not ca or ca in SEEN:
+                    continue
 
-            chat_link = get_chat_link(ca)
+                SEEN.add(ca)
 
-            if chat_link:
-                print(f"✅ FOUND CHAT: {name}")
+                chat = get_chat_link(ca)
 
-                msg = f"""
-🚨 *NEW COIN WITH CHAT*
+                if chat:
+                    print(f"✅ FOUND CHAT: {name}")
 
-💎 Name: {name}
-📜 CA: `{ca}`
-💰 MC: ${mc}
+                    msg = f"""
+NEW COIN WITH CHAT
 
-💬 Chat:
-{chat_link}
+Name: {name}
+CA: {ca}
 
-🔗 https://pump.fun/{ca}
+Chat:
+{chat}
+
+https://pump.fun/{ca}
 """
 
-                send_telegram(msg)
+                    send_telegram(msg)
+
+            except Exception as e:
+                print("Loop error:", e)
 
         time.sleep(15)
 
 # ===== START =====
 if __name__ == "__main__":
-    keep_alive()  # fixes Render port issue
+    keep_alive()
     main()
