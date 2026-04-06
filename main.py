@@ -4,113 +4,104 @@ import re
 from flask import Flask
 from threading import Thread
 
-# ===== CONFIG =====
 BOT_TOKEN = "8710292892:AAHGhAR_2xdkXba2wNclnyl5wOK_OjE38I4"
 CHAT_ID = "5578314612"
 
-SEEN = set()
-
-# ===== KEEP ALIVE =====
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot is running"
+    return "Bot running"
 
 def run():
-    app.run(host='0.0.0.0', port=10000)
+    app.run(host="0.0.0.0", port=10000)
 
 def keep_alive():
-    t = Thread(target=run)
-    t.start()
+    Thread(target=run).start()
 
-# ===== TELEGRAM TEST =====
-def send_telegram(text):
+
+# STORE COINS TO RECHECK
+WATCHLIST = {}  # ca -> timestamp
+SEEN_SENT = set()
+
+
+# ================= TELEGRAM =================
+def send_telegram(msg):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    data = {
-        "chat_id": CHAT_ID,
-        "text": text
-    }
+    requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
 
-    try:
-        r = requests.post(url, data=data)
-        print("Telegram response:", r.text)
-    except Exception as e:
-        print("Telegram error:", e)
 
-# ===== GET COINS =====
-def get_new_coins():
+# ================= FETCH COINS =================
+def get_coins():
     try:
-        r = requests.get("https://frontend-api.pump.fun/coins", timeout=10)
-        data = r.json()
-        print(f"Fetched {len(data)} coins")
-        return data
-    except Exception as e:
-        print("Error fetching coins:", e)
+        url = "https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=desc"
+        r = requests.get(url, timeout=10)
+        return r.json()
+    except:
         return []
 
-# ===== GET CHAT =====
-def get_chat_link(ca):
-    try:
-        url = f"https://pump.fun/{ca}"
-        r = requests.get(url, timeout=10)
 
+# ================= CHAT DETECTOR =================
+def get_chat(ca):
+    try:
+        r = requests.get(f"https://pump.fun/{ca}", timeout=10)
         match = re.search(r"(https://pump\.fun/chat/[a-zA-Z0-9]+)", r.text)
         if match:
             return match.group(1)
-
-    except Exception as e:
-        print("Chat fetch error:", e)
-
+    except:
+        pass
     return None
 
-# ===== MAIN LOOP =====
-def main():
-    print("🔥 BOT STARTED")
 
-    # 🔥 FORCE TEST MESSAGE
-    send_telegram("✅ Bot is LIVE and scanning!")
+# ================= MAIN SNIPER =================
+def main():
+    print("🔥 SNIPER BOT STARTED")
+    send_telegram("🚀 Pump.fun sniper bot LIVE")
 
     while True:
-        coins = get_new_coins()
+        coins = get_coins()
 
-        for coin in coins:
-            try:
-                ca = coin.get("mint")
-                name = coin.get("name")
+        now = time.time()
 
-                print(f"Checking: {name} | {ca}")
+        for c in coins:
+            ca = c.get("mint")
+            name = c.get("name")
 
-                if not ca or ca in SEEN:
-                    continue
+            if not ca:
+                continue
 
-                SEEN.add(ca)
+            # add to watchlist (track for 5 min)
+            if ca not in WATCHLIST:
+                WATCHLIST[ca] = now
+                print(f"👀 Tracking new coin: {name}")
 
-                chat = get_chat_link(ca)
+            # re-check only for 5 minutes
+            age = now - WATCHLIST[ca]
+            if age > 300:
+                continue
 
-                if chat:
-                    print(f"✅ FOUND CHAT: {name}")
+            chat = get_chat(ca)
 
-                    msg = f"""
-NEW COIN WITH CHAT
+            if chat and ca not in SEEN_SENT:
+                SEEN_SENT.add(ca)
+
+                msg = f"""
+🚨 NEW PUMP.FUN COIN WITH CHAT
 
 Name: {name}
 CA: {ca}
 
-Chat:
+💬 Chat:
 {chat}
 
 https://pump.fun/{ca}
 """
+                print(f"💬 FOUND CHAT: {name}")
+                send_telegram(msg)
 
-                    send_telegram(msg)
+        time.sleep(10)
 
-            except Exception as e:
-                print("Loop error:", e)
 
-        time.sleep(15)
-
-# ===== START =====
 if __name__ == "__main__":
     keep_alive()
     main()
