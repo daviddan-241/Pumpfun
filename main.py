@@ -4,104 +4,134 @@ import re
 from flask import Flask
 from threading import Thread
 
-BOT_TOKEN = "8710292892:AAHGhAR_2xdkXba2wNclnyl5wOK_OjE38I4"
+# ================== CONFIG ==================
+BOT_TOKEN = "8710292892:AAFI3UJ8LXcekksJeWd39B5DJvo7FhGOvnE"
 CHAT_ID = "5578314612"
 
 app = Flask(__name__)
 
-@app.route('/')
+WATCHLIST = {}
+SENT = set()
+
+session = requests.Session()
+session.headers.update({"User-Agent": "Mozilla/5.0"})
+
+
+# ================== KEEP ALIVE ==================
+@app.route("/")
 def home():
     return "Bot running"
 
 def run():
     app.run(host="0.0.0.0", port=10000)
 
-def keep_alive():
-    Thread(target=run).start()
+
+# ================== TELEGRAM ==================
+def send(msg):
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        session.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
+    except Exception as e:
+        print("Telegram error:", e, flush=True)
 
 
-# STORE COINS TO RECHECK
-WATCHLIST = {}  # ca -> timestamp
-SEEN_SENT = set()
-
-
-# ================= TELEGRAM =================
-def send_telegram(msg):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
-
-
-# ================= FETCH COINS =================
-def get_coins():
+# ================== NEW COINS ONLY ==================
+def get_new_coins():
     try:
         url = "https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=desc"
-        r = requests.get(url, timeout=10)
+        r = session.get(url, timeout=10)
         return r.json()
     except:
         return []
 
 
-# ================= CHAT DETECTOR =================
-def get_chat(ca):
+# ================== CHAT CHECK (REAL VERIFICATION) ==================
+def check_chat(mint):
     try:
-        r = requests.get(f"https://pump.fun/{ca}", timeout=10)
-        match = re.search(r"(https://pump\.fun/chat/[a-zA-Z0-9]+)", r.text)
+        url = f"https://pump.fun/{mint}"
+        r = session.get(url, timeout=10)
+
+        html = r.text.lower()
+
+        # must contain chat keyword
+        if "chat" not in html:
+            return None
+
+        match = re.search(r"https://pump\.fun/chat/[a-zA-Z0-9]+", r.text)
+
         if match:
-            return match.group(1)
+            return match.group(0)
+
     except:
         pass
+
     return None
 
 
-# ================= MAIN SNIPER =================
-def main():
-    print("🔥 SNIPER BOT STARTED")
-    send_telegram("🚀 Pump.fun sniper bot LIVE")
+# ================== DOUBLE VERIFY ==================
+def verify_chat(mint):
+    first = check_chat(mint)
+    if not first:
+        return None
+
+    time.sleep(0.5)
+
+    second = check_chat(mint)
+
+    if first and second:
+        return second
+
+    return None
+
+
+# ================== BOT LOOP ==================
+def bot():
+    print("🔥 BOT STARTED", flush=True)
+    send("🚀 Pump.fun NEW COIN CHAT bot LIVE")
 
     while True:
-        coins = get_coins()
-
+        coins = get_new_coins()
         now = time.time()
 
         for c in coins:
-            ca = c.get("mint")
-            name = c.get("name")
+            mint = c.get("mint")
+            name = c.get("name", "Unknown")
 
-            if not ca:
+            if not mint:
                 continue
 
-            # add to watchlist (track for 5 min)
-            if ca not in WATCHLIST:
-                WATCHLIST[ca] = now
-                print(f"👀 Tracking new coin: {name}")
+            # track only new coins
+            if mint not in WATCHLIST:
+                WATCHLIST[mint] = now
+                print(f"👀 New coin: {name}", flush=True)
 
-            # re-check only for 5 minutes
-            age = now - WATCHLIST[ca]
-            if age > 300:
+            # only keep 5 min window
+            if now - WATCHLIST[mint] > 300:
                 continue
 
-            chat = get_chat(ca)
+            if mint in SENT:
+                continue
 
-            if chat and ca not in SEEN_SENT:
-                SEEN_SENT.add(ca)
+            chat = verify_chat(mint)
 
-                msg = f"""
-🚨 NEW PUMP.FUN COIN WITH CHAT
+            if chat:
+                SENT.add(mint)
 
-Name: {name}
-CA: {ca}
+                msg = (
+                    "🚨 NEW PUMP.FUN COIN WITH CHAT\n\n"
+                    f"Name: {name}\n"
+                    f"CA: {mint}\n\n"
+                    f"💬 Chat:\n{chat}\n\n"
+                    f"https://pump.fun/{mint}"
+                )
 
-💬 Chat:
-{chat}
+                print(f"💬 SENT: {name}", flush=True)
+                send(msg)
 
-https://pump.fun/{ca}
-"""
-                print(f"💬 FOUND CHAT: {name}")
-                send_telegram(msg)
-
-        time.sleep(10)
+        time.sleep(6)
 
 
+# ================== START ==================
 if __name__ == "__main__":
-    keep_alive()
-    main()
+    Thread(target=run).start()
+    bot()
