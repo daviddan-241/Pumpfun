@@ -1,11 +1,32 @@
 import requests
 import time
 import re
+from flask import Flask
+from threading import Thread
 
+# ================== CONFIG ==================
 BOT_TOKEN = "8710292892:AAHGhAR_2xdkXba2wNclnyl5wOK_OjE38I4"
 CHAT_ID = "5578314612"
 
+# ============================================
+
 SEEN = set()
+
+# ===== KEEP ALIVE (FOR RENDER WEB SERVICE) =====
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running"
+
+def run():
+    app.run(host='0.0.0.0', port=10000)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+
+# ==============================================
 
 def get_new_coins():
     url = "https://frontend-api.pump.fun/coins"
@@ -45,10 +66,12 @@ def send_telegram(text):
         pass
 
 def main():
-    print("🔥 Scanning pump.fun for coins WITH chats...")
+    print("🔥 Scanning pump.fun for NEW coins with chats...")
 
     while True:
         coins = get_new_coins()
+
+        print(f"Scanning {len(coins)} coins...")
 
         for coin in coins:
             ca = coin.get("mint")
@@ -63,7 +86,7 @@ def main():
             chat_link = get_chat_link(ca)
 
             if chat_link:
-                print(f"✅ FOUND: {name}")
+                print(f"✅ FOUND CHAT: {name}")
 
                 msg = f"""
 🚨 *NEW COIN WITH CHAT*
@@ -82,5 +105,7 @@ def main():
 
         time.sleep(15)
 
+# ===== START =====
 if __name__ == "__main__":
+    keep_alive()  # fixes Render port issue
     main()
