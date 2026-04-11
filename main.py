@@ -6,8 +6,8 @@ from flask import Flask
 from threading import Thread
 
 # ================= CONFIG =================
-BOT_TOKEN = "8710292892:AAFI3UJ8LXcekksJeWd39B5DJvo7FhGOvnE"
-CHAT_ID = "5578314612"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8768676919:AAFbHfcNAU_x899JeIIiduOBKEdj1xHw404")
+CHAT_ID = os.environ.get("CHAT_ID", "-5191938939")
 
 app = Flask(__name__)
 
@@ -32,7 +32,8 @@ def home():
 
 
 def run_flask():
-    app.run(host="0.0.0.0", port=10000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
 
 
 # ================= TELEGRAM =================
