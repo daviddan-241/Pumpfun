@@ -16,8 +16,9 @@ SENT = set()
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
     "Connection": "keep-alive",
     "Accept-Encoding": "gzip, deflate, br",
     "Origin": "https://pump.fun",
@@ -38,47 +39,51 @@ def run_flask():
 
 # ================= TELEGRAM =================
 def send_telegram(msg):
-    for attempt in range(3):  # Retry sending
+    for attempt in range(3):
         try:
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-            r = session.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
+            r = requests.post(url, data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=10)
 
             if r.status_code != 200:
                 print(f"Telegram Error (attempt {attempt+1}):", r.text[:200], flush=True)
             else:
-                return  # Stop retrying after a successful send
+                print("✅ Telegram message sent successfully", flush=True)
+                return
 
         except Exception as e:
             print(f"Telegram Exception (attempt {attempt+1}):", e, flush=True)
-            time.sleep(2)  # Small delay before retry
+            time.sleep(2)
 
 
-# ================= SAFE COIN FETCH =================
+# ================= COIN FETCH (v3 API) =================
 def get_coins():
     retries = 3
-    delay = 2  # Start with 2 seconds
+    delay = 2
     for attempt in range(retries):
         try:
-            url = "https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=desc"
-            r = session.get(url, timeout=10)
+            url = "https://frontend-api-v3.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=true"
+            r = session.get(url, timeout=15)
 
             if r.status_code != 200:
-                print("API blocked (status):", r.status_code, flush=True)
-                time.sleep(delay)
-                delay *= 2  # Exponential backoff
-                continue
-
-            text = r.text.strip()
-            if not text or text.startswith("<"):
-                print("API returned non-JSON (blocked or HTML)", flush=True)
+                print(f"API blocked (status {r.status_code}), retrying...", flush=True)
                 time.sleep(delay)
                 delay *= 2
                 continue
 
-            return r.json()
+            text = r.text.strip()
+            if not text or text.startswith("<"):
+                print("API returned non-JSON, retrying...", flush=True)
+                time.sleep(delay)
+                delay *= 2
+                continue
+
+            data = r.json()
+            if isinstance(data, list):
+                return data
+            return data.get("coins", data) if isinstance(data, dict) else []
 
         except Exception as e:
-            print(f"API error (attempt {attempt + 1}/{retries}):", e, flush=True)
+            print(f"API error (attempt {attempt + 1}/{retries}): {e}", flush=True)
             time.sleep(delay)
             delay *= 2
 
@@ -86,95 +91,106 @@ def get_coins():
     return []
 
 
-# ================= CHAT DETECTOR =================
-def get_chat(mint):
+# ================= PUMP.FUN PAGE CHAT DETECTOR =================
+def get_pumpfun_chat(mint):
     try:
         url = f"https://pump.fun/{mint}"
         r = session.get(url, timeout=10)
-
-        html = r.text.lower()
-
-        if "chat" not in html:
-            return None
-
         match = re.search(r"https://pump\.fun/chat/[a-zA-Z0-9]+", r.text)
         if match:
             return match.group(0)
-
     except Exception as e:
-        print("Chat error:", e, flush=True)
-
-    return None
-
-
-# ================= VERIFY CHAT =================
-def verify_chat(mint):
-    first = get_chat(mint)
-    if not first:
-        return None
-
-    time.sleep(0.5)
-
-    second = get_chat(mint)
-
-    if first and second:
-        return second
-
+        print(f"Chat page error: {e}", flush=True)
     return None
 
 
 # ================= BOT LOOP =================
 def bot_loop():
     print("🔥 BOT LOOP STARTED", flush=True)
-    send_telegram("🚀 Pump.fun bot LIVE (stable mode)")
+    send_telegram("🚀 Pump.fun bot LIVE — scanning for new coins with chat links...")
 
     while True:
         try:
             coins = get_coins()
             now = time.time()
 
-            print(f"👀 scanning {len(coins)} coins", flush=True)
+            if coins:
+                print(f"👀 Scanning {len(coins)} coins...", flush=True)
+            else:
+                print("⚠️ No coins returned, will retry next cycle", flush=True)
 
             for c in coins:
                 mint = c.get("mint")
                 name = c.get("name", "Unknown")
+                symbol = c.get("symbol", "")
+                telegram_link = c.get("telegram") or ""
+                twitter_link = c.get("twitter") or ""
+                description = c.get("description", "")
 
                 if not mint:
                     continue
 
-                # track new coins
+                # Track new coins
                 if mint not in WATCHLIST:
                     WATCHLIST[mint] = now
-                    print(f"👀 Tracking new coin: {name} with CA: {mint}", flush=True)
+                    print(f"📌 New coin: {name} ({symbol}) | TG: {'yes' if telegram_link else 'no'}", flush=True)
 
-                # 5-minute time window for active tracking
-                if now - WATCHLIST[mint] > 300:
+                # Only track within 10-minute window
+                if now - WATCHLIST[mint] > 600:
                     continue
 
                 if mint in SENT:
                     continue
 
-                # Verify if the coin has a valid Pump.fun chat
-                chat = verify_chat(mint)
+                chat_link = None
 
-                if chat:
+                # Method 1: Direct Telegram link from API response
+                if telegram_link and telegram_link.startswith("http"):
+                    chat_link = telegram_link
+                    print(f"💬 Telegram link found in API for: {name}", flush=True)
+
+                # Method 2: pump.fun internal chat page
+                if not chat_link:
+                    pf_chat = get_pumpfun_chat(mint)
+                    if pf_chat:
+                        chat_link = pf_chat
+                        print(f"💬 Pump.fun chat found for: {name}", flush=True)
+
+                if chat_link:
                     SENT.add(mint)
 
-                    msg = (
-                        "🚨 VERIFIED PUMP.FUN COIN WITH CHAT\n\n"
-                        f"Name: {name}\n"
-                        f"Contract Address: {mint}\n\n"
-                        f"💬 Chat:\n{chat}\n\n"
-                        f"https://pump.fun/{mint}"
-                    )
+                    lines = [
+                        "🚨 <b>NEW PUMP.FUN COIN WITH CHAT</b>",
+                        "",
+                        f"🪙 <b>Name:</b> {name} (${symbol})",
+                        f"📋 <b>CA:</b> <code>{mint}</code>",
+                    ]
 
-                    print(f"💬 SENT TO TELEGRAM: {name}", flush=True)
+                    if description:
+                        lines.append(f"📝 {description[:100]}")
+
+                    lines += [
+                        "",
+                        f"💬 <b>Chat:</b> {chat_link}",
+                    ]
+
+                    if twitter_link:
+                        lines.append(f"🐦 <b>Twitter:</b> {twitter_link}")
+
+                    lines += [
+                        "",
+                        f"🔗 https://pump.fun/{mint}",
+                        f"📊 https://dexscreener.com/solana/{mint}",
+                    ]
+
+                    msg = "\n".join(lines)
+                    print(f"📨 Sending to Telegram: {name} ({symbol})", flush=True)
                     send_telegram(msg)
 
             time.sleep(8)
 
         except Exception as e:
-            print("Loop crash:", e, flush=True)
+            print(f"Loop crash: {e}", flush=True)
             time.sleep(5)
 
 
