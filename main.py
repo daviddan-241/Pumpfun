@@ -204,9 +204,11 @@ def bot_loop():
 
                 SENT.add(mint)
 
-                # Send ONLY the bare URL — Telegram renders the full rich preview card
-                print(f"📨 {name} ({symbol}) | replies={reply_count} | age={int(age_secs)}s | {chat_url}", flush=True)
-                send_telegram(chat_url)
+                # Send the coin page URL — chat invite confirms it has a community,
+                # but we share the coin link so Telegram previews the coin itself
+                coin_url = f"https://pump.fun/coin/{mint}"
+                print(f"📨 {name} ({symbol}) | replies={reply_count} | age={int(age_secs)}s | {coin_url}", flush=True)
+                send_telegram(coin_url)
 
             time.sleep(8)
 
