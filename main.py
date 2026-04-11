@@ -8,17 +8,16 @@ from threading import Thread
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8768676919:AAFbHfcNAU_x899JeIIiduOBKEdj1xHw404")
 CHAT_ID = os.environ.get("CHAT_ID", "-5191938939")
 
-# Only alert for coins newer than this many minutes
-MAX_AGE_MINUTES = int(os.environ.get("MAX_AGE_MINUTES", "10"))
+# Only alert for coins newer than this many seconds after creation
+MAX_AGE_SECS = int(os.environ.get("MAX_AGE_SECS", "300"))   # 5 minutes
 
-# Minimum reply count to consider a coin active
+# Minimum replies before alerting (community activity signal)
 MIN_REPLIES = int(os.environ.get("MIN_REPLIES", "1"))
 
-# Seconds to wait between Telegram sends
+# Delay between Telegram sends (seconds)
 SEND_DELAY = float(os.environ.get("SEND_DELAY", "3"))
 
 app = Flask(__name__)
-
 SENT = set()
 last_send_time = 0.0
 
@@ -47,7 +46,6 @@ def run_flask():
 def send_telegram(msg):
     global last_send_time
 
-    # Enforce minimum gap between sends
     elapsed = time.time() - last_send_time
     if elapsed < SEND_DELAY:
         time.sleep(SEND_DELAY - elapsed)
@@ -61,7 +59,7 @@ def send_telegram(msg):
                     "chat_id": CHAT_ID,
                     "text": msg,
                     "parse_mode": "HTML",
-                    "disable_web_page_preview": "true"
+                    "disable_web_page_preview": "false"
                 },
                 timeout=10
             )
@@ -69,23 +67,23 @@ def send_telegram(msg):
 
             if r.status_code == 429:
                 retry_after = r.json().get("parameters", {}).get("retry_after", 30)
-                print(f"⏳ Rate limited, waiting {retry_after}s...", flush=True)
+                print(f"⏳ Rate limited — waiting {retry_after}s", flush=True)
                 time.sleep(retry_after + 1)
                 continue
 
             if r.status_code != 200:
-                print(f"Telegram Error (attempt {attempt+1}): {r.text[:200]}", flush=True)
+                print(f"Telegram error (attempt {attempt+1}): {r.text[:150]}", flush=True)
                 time.sleep(2)
             else:
-                print("✅ Sent to Telegram", flush=True)
+                print("✅ Sent", flush=True)
                 return
 
         except Exception as e:
-            print(f"Telegram Exception (attempt {attempt+1}): {e}", flush=True)
+            print(f"Telegram exception (attempt {attempt+1}): {e}", flush=True)
             time.sleep(2)
 
 
-# ================= COIN FETCH (v3 API) =================
+# ================= COIN FETCH =================
 def get_coins():
     retries = 3
     delay = 2
@@ -95,14 +93,13 @@ def get_coins():
             r = api_session.get(url, timeout=15)
 
             if r.status_code != 200:
-                print(f"API status {r.status_code}, retrying...", flush=True)
+                print(f"API status {r.status_code}", flush=True)
                 time.sleep(delay)
                 delay *= 2
                 continue
 
             text = r.text.strip()
             if not text or text.startswith("<"):
-                print("API returned non-JSON, retrying...", flush=True)
                 time.sleep(delay)
                 delay *= 2
                 continue
@@ -111,55 +108,25 @@ def get_coins():
             return data if isinstance(data, list) else data.get("coins", [])
 
         except Exception as e:
-            print(f"API error (attempt {attempt+1}/{retries}): {e}", flush=True)
+            print(f"API error (attempt {attempt+1}): {e}", flush=True)
             time.sleep(delay)
             delay *= 2
 
     return []
 
 
-# ================= CHECK FOR PUMP.FUN COMMUNITY CHAT =================
-def check_community_chat(mint):
-    """
-    Hits the pump.fun coin page and looks for the community chat section.
-    The section is only fully rendered (with community name visible) for coins
-    that have an active community. Falls back to 'Join chat' presence as minimum signal.
-    Returns True if the coin page shows a community chat.
-    """
-    try:
-        url = f"https://pump.fun/coin/{mint}"
-        r = api_session.get(url, timeout=15)
-        if r.status_code == 200:
-            html = r.text
-            # Look for the specific community chat section in the rendered HTML
-            # "chat" text appearing near the coin image in the community section
-            # indicates an established community (not just the generic Join button)
-            has_chat_section = (
-                "Join chat" in html and
-                (" chat</div>" in html or "<!-- --> chat" in html)
-            )
-            return has_chat_section
-    except Exception as e:
-        print(f"Chat check error: {e}", flush=True)
-    return False
-
-
 # ================= BOT LOOP =================
 def bot_loop():
     print("🔥 BOT LOOP STARTED", flush=True)
-    send_telegram(
-        "🚀 <b>Pump.fun chat monitor is LIVE</b>\n\n"
-        "Watching for new coins with active holders community chats..."
-    )
+    send_telegram("🚀 Bot is LIVE — scanning pump.fun for new coins with community chats...")
 
     while True:
         try:
             coins = get_coins()
             now = time.time()
-            max_age_secs = MAX_AGE_MINUTES * 60
 
             if coins:
-                print(f"👀 Scanning {len(coins)} coins...", flush=True)
+                print(f"👀 Scanning {len(coins)} coins", flush=True)
 
             for c in coins:
                 mint = c.get("mint")
@@ -168,37 +135,30 @@ def bot_loop():
 
                 name = c.get("name", "Unknown")
                 symbol = c.get("symbol", "")
-                created_ts = c.get("created_timestamp", 0) / 1000
-                reply_count = c.get("reply_count", 0) or 0
+                created_ts = (c.get("created_timestamp") or 0) / 1000
+                reply_count = c.get("reply_count") or 0
                 age_secs = now - created_ts
 
-                # Only look at fresh coins within the time window
-                if age_secs > max_age_secs:
+                # Only fresh coins
+                if age_secs > MAX_AGE_SECS:
                     continue
 
-                # Must have at least MIN_REPLIES to show community activity
+                # Must have community activity
                 if reply_count < MIN_REPLIES:
                     continue
 
-                # Check if coin page shows a community chat section
-                if check_community_chat(mint):
-                    SENT.add(mint)
+                SENT.add(mint)
 
-                    age_mins = int(age_secs / 60)
-                    age_str = f"{age_mins}m ago" if age_mins > 0 else "just now"
+                # The pump.fun/chat/{mint} URL is the actual holders community chat page
+                chat_url = f"https://pump.fun/chat/{mint}"
 
-                    msg = (
-                        "🔥 <b>PUMP.FUN COIN WITH COMMUNITY CHAT</b>\n\n"
-                        f"🪙 <b>{name}</b> (${symbol})\n"
-                        f"📋 <b>CA:</b> <code>{mint}</code>\n"
-                        f"🕐 Created: {age_str}\n"
-                        f"💬 Replies: {reply_count}\n\n"
-                        f"👥 <b>Join the holders chat:</b>\n"
-                        f"https://pump.fun/coin/{mint}"
-                    )
+                msg = (
+                    f"🆕 pump.fun new update\n\n"
+                    f"{chat_url}"
+                )
 
-                    print(f"💬 Community chat found: {name} ({symbol}) | replies={reply_count}", flush=True)
-                    send_telegram(msg)
+                print(f"📨 {name} ({symbol}) | replies={reply_count} | age={int(age_secs)}s", flush=True)
+                send_telegram(msg)
 
             time.sleep(8)
 
