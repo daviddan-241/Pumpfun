@@ -204,11 +204,30 @@ def bot_loop():
 
                 SENT.add(mint)
 
-                # Send the coin page URL — chat invite confirms it has a community,
-                # but we share the coin link so Telegram previews the coin itself
+                usd_mc = c.get("usd_market_cap") or 0
+                if usd_mc >= 1_000_000:
+                    mc_str = f"${usd_mc/1_000_000:.2f}M"
+                elif usd_mc >= 1_000:
+                    mc_str = f"${usd_mc/1_000:.1f}K"
+                else:
+                    mc_str = f"${usd_mc:.2f}"
+
+                mins = int(age_secs) // 60
+                secs = int(age_secs) % 60
+                age_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+
                 coin_url = f"https://pump.fun/coin/{mint}"
-                print(f"📨 {name} ({symbol}) | replies={reply_count} | age={int(age_secs)}s | {coin_url}", flush=True)
-                send_telegram(coin_url)
+
+                msg = (
+                    f"🆕 {name} (${symbol})\n"
+                    f"💰 MC: {mc_str}\n"
+                    f"⏱ Age: {age_str}\n"
+                    f"💬 Replies: {reply_count}\n\n"
+                    f"{coin_url}"
+                )
+
+                print(f"📨 {name} ({symbol}) | MC={mc_str} | replies={reply_count} | age={age_str}", flush=True)
+                send_telegram(msg)
 
             time.sleep(8)
 
