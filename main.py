@@ -8,14 +8,12 @@ from threading import Thread
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8768676919:AAFbHfcNAU_x899JeIIiduOBKEdj1xHw404")
 CHAT_ID = os.environ.get("CHAT_ID", "-5191938939")
 
-# Only alert for coins newer than this many seconds after creation
-MAX_AGE_SECS = int(os.environ.get("MAX_AGE_SECS", "300"))   # 5 minutes
-
-# Minimum replies before alerting (community activity signal)
+MAX_AGE_SECS = int(os.environ.get("MAX_AGE_SECS", "300"))
 MIN_REPLIES = int(os.environ.get("MIN_REPLIES", "1"))
-
-# Delay between Telegram sends (seconds)
 SEND_DELAY = float(os.environ.get("SEND_DELAY", "3"))
+
+# Self-ping interval in seconds (keeps the server alive on Render / UptimeRobot)
+PING_INTERVAL = int(os.environ.get("PING_INTERVAL", "240"))
 
 app = Flask(__name__)
 SENT = set()
@@ -39,15 +37,38 @@ chat_session.headers.update({
 })
 
 
-# ================= FLASK KEEP ALIVE =================
+# ================= FLASK =================
 @app.route("/")
 def home():
-    return "Bot is LIVE"
+    return "Bot is LIVE", 200
+
+@app.route("/ping")
+def ping():
+    return "pong", 200
 
 
 def run_flask():
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
+
+# ================= SELF-PING (keep-alive) =================
+def self_ping():
+    """
+    Pings the bot's own / endpoint every PING_INTERVAL seconds.
+    Keeps Render web services awake and satisfies UptimeRobot health checks.
+    Set your UptimeRobot monitor to the same public URL.
+    """
+    time.sleep(30)
+    port = int(os.environ.get("PORT", 5000))
+    url = os.environ.get("RENDER_EXTERNAL_URL", f"http://localhost:{port}")
+    while True:
+        try:
+            r = requests.get(f"{url}/ping", timeout=10)
+            print(f"🏓 Self-ping {r.status_code}", flush=True)
+        except Exception as e:
+            print(f"⚠️ Self-ping failed: {e}", flush=True)
+        time.sleep(PING_INTERVAL)
 
 
 # ================= TELEGRAM =================
@@ -66,7 +87,6 @@ def send_telegram(msg):
                 data={
                     "chat_id": CHAT_ID,
                     "text": msg,
-                    "parse_mode": "HTML",
                     "disable_web_page_preview": "false"
                 },
                 timeout=10
@@ -126,9 +146,8 @@ def get_coins():
 # ================= CHAT INVITE FETCH =================
 def get_invite_link(mint):
     """
-    Fetches the short invite link ID from the pump.fun chat API.
-    Returns the full chat URL like https://pump.fun/chat/{inviteLinkId},
-    or None if the coin has no community chat set up yet.
+    Returns https://pump.fun/chat/{inviteLinkId} for coins that have an active
+    community chat, or None if the chat group doesn't exist yet.
     """
     try:
         url = f"https://chat-api-v1.pump.fun/invites/coin/{mint}"
@@ -137,8 +156,7 @@ def get_invite_link(mint):
         if r.status_code != 200:
             return None
 
-        data = r.json()
-        invite_id = data.get("inviteLinkId")
+        invite_id = r.json().get("inviteLinkId")
         if not invite_id:
             return None
 
@@ -173,29 +191,22 @@ def bot_loop():
                 reply_count = c.get("reply_count") or 0
                 age_secs = now - created_ts
 
-                # Only fresh coins
                 if age_secs > MAX_AGE_SECS:
                     continue
 
-                # Must have community activity
                 if reply_count < MIN_REPLIES:
                     continue
 
-                # Fetch the real short invite link from the chat API
                 chat_url = get_invite_link(mint)
                 if not chat_url:
-                    print(f"⏭️ {name} ({symbol}) — no chat group yet, skipping", flush=True)
+                    print(f"⏭️ {name} ({symbol}) — no chat yet", flush=True)
                     continue
 
                 SENT.add(mint)
 
-                msg = (
-                    f"🆕 pump.fun new update\n\n"
-                    f"{chat_url}"
-                )
-
+                # Send ONLY the bare URL — Telegram renders the full rich preview card
                 print(f"📨 {name} ({symbol}) | replies={reply_count} | age={int(age_secs)}s | {chat_url}", flush=True)
-                send_telegram(msg)
+                send_telegram(chat_url)
 
             time.sleep(8)
 
@@ -210,5 +221,7 @@ if __name__ == "__main__":
 
     Thread(target=run_flask, daemon=True).start()
     time.sleep(2)
+
+    Thread(target=self_ping, daemon=True).start()
 
     bot_loop()
