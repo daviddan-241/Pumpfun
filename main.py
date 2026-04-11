@@ -170,7 +170,7 @@ def get_invite_link(mint):
 # ================= BOT LOOP =================
 def bot_loop():
     print("🔥 BOT LOOP STARTED", flush=True)
-    send_telegram("🚀 Bot is LIVE — scanning pump.fun for new coins with community chats...")
+    send_telegram("🚀 Bot is LIVE — scanning pump.fun for new coins with active devs...")
 
     while True:
         try:
