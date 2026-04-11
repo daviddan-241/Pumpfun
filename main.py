@@ -30,6 +30,14 @@ api_session.headers.update({
     "Referer": "https://pump.fun/"
 })
 
+chat_session = requests.Session()
+chat_session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Origin": "https://pump.fun",
+    "Referer": "https://pump.fun/"
+})
+
 
 # ================= FLASK KEEP ALIVE =================
 @app.route("/")
@@ -115,6 +123,32 @@ def get_coins():
     return []
 
 
+# ================= CHAT INVITE FETCH =================
+def get_invite_link(mint):
+    """
+    Fetches the short invite link ID from the pump.fun chat API.
+    Returns the full chat URL like https://pump.fun/chat/{inviteLinkId},
+    or None if the coin has no community chat set up yet.
+    """
+    try:
+        url = f"https://chat-api-v1.pump.fun/invites/coin/{mint}"
+        r = chat_session.get(url, timeout=10)
+
+        if r.status_code != 200:
+            return None
+
+        data = r.json()
+        invite_id = data.get("inviteLinkId")
+        if not invite_id:
+            return None
+
+        return f"https://pump.fun/chat/{invite_id}"
+
+    except Exception as e:
+        print(f"Chat API error for {mint}: {e}", flush=True)
+        return None
+
+
 # ================= BOT LOOP =================
 def bot_loop():
     print("🔥 BOT LOOP STARTED", flush=True)
@@ -147,17 +181,20 @@ def bot_loop():
                 if reply_count < MIN_REPLIES:
                     continue
 
-                SENT.add(mint)
+                # Fetch the real short invite link from the chat API
+                chat_url = get_invite_link(mint)
+                if not chat_url:
+                    print(f"⏭️ {name} ({symbol}) — no chat group yet, skipping", flush=True)
+                    continue
 
-                # The pump.fun/chat/{mint} URL is the actual holders community chat page
-                chat_url = f"https://pump.fun/chat/{mint}"
+                SENT.add(mint)
 
                 msg = (
                     f"🆕 pump.fun new update\n\n"
                     f"{chat_url}"
                 )
 
-                print(f"📨 {name} ({symbol}) | replies={reply_count} | age={int(age_secs)}s", flush=True)
+                print(f"📨 {name} ({symbol}) | replies={reply_count} | age={int(age_secs)}s | {chat_url}", flush=True)
                 send_telegram(msg)
 
             time.sleep(8)
