@@ -6,7 +6,7 @@ from threading import Thread
 
 # ================= CONFIG =================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8768676919:AAFbHfcNAU_x899JeIIiduOBKEdj1xHw404")
-CHAT_ID = os.environ.get("CHAT_ID", "-5191938939")
+CHAT_ID = os.environ.get("CHAT_ID", "-1003908847150")
 
 MAX_AGE_SECS = int(os.environ.get("MAX_AGE_SECS", "300"))
 MIN_REPLIES = int(os.environ.get("MIN_REPLIES", "1"))
