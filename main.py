@@ -9,16 +9,20 @@ from threading import Thread
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8768676919:AAFbHfcNAU_x899JeIIiduOBKEdj1xHw404")
 CHAT_ID = os.environ.get("CHAT_ID", "-1003908847150")
 
-# Only consider coins newer than this many seconds
-MAX_AGE_SECS = int(os.environ.get("MAX_AGE_SECS", "600"))
+# Only consider coins newer than this many seconds. Wider window = more
+# candidates that have had time to spin up a community chat.
+MAX_AGE_SECS = int(os.environ.get("MAX_AGE_SECS", "1800"))
 
 # Minimum replies to qualify (pump.fun's listing endpoint usually reports 0,
 # so leave this at 0 unless you really want to gate on it).
 MIN_REPLIES = int(os.environ.get("MIN_REPLIES", "0"))
 
 # If "1", only send coins that already have an active community chat.
-# Default "0" so the bot drops steadily even when chats don't exist yet.
-REQUIRE_CHAT = os.environ.get("REQUIRE_CHAT", "0") == "1"
+# Default "1" — user only wants coins that have a real group attached.
+REQUIRE_CHAT = os.environ.get("REQUIRE_CHAT", "1") == "1"
+
+# Seconds to remember a "no chat yet" result so we don't hammer the chat API.
+NO_CHAT_TTL = int(os.environ.get("NO_CHAT_TTL", "90"))
 
 # Throttle Telegram sends so the channel gets a steady drip, not a burst.
 SEND_DELAY = float(os.environ.get("SEND_DELAY", "4"))
@@ -28,6 +32,9 @@ MAX_PER_SCAN = int(os.environ.get("MAX_PER_SCAN", "3"))
 
 # Polling cadence for the pump.fun listing endpoint.
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "8"))
+
+# How many coins to pull per listing call.
+LISTING_LIMIT = int(os.environ.get("LISTING_LIMIT", "100"))
 
 # Self-ping interval (keeps the server alive on Render / UptimeRobot).
 PING_INTERVAL = int(os.environ.get("PING_INTERVAL", "240"))
@@ -40,6 +47,10 @@ app = Flask(__name__)
 # Cap the dedupe set so memory stays bounded over long runs.
 SENT = set()
 SENT_ORDER = deque(maxlen=5000)
+
+# Cache "no chat yet" lookups so we don't recheck the same mint every 8s.
+# mint -> unix_timestamp_when_we_can_recheck
+NO_CHAT_CACHE = {}
 
 last_send_time = 0.0
 
@@ -144,7 +155,10 @@ def get_coins():
     delay = 2
     for attempt in range(retries):
         try:
-            url = "https://frontend-api-v3.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=true"
+            url = (
+                "https://frontend-api-v3.pump.fun/coins"
+                f"?offset=0&limit={LISTING_LIMIT}&sort=created_timestamp&order=DESC&includeNsfw=true"
+            )
             r = api_session.get(url, timeout=15)
 
             if r.status_code != 200:
@@ -287,14 +301,30 @@ def bot_loop():
             # Send oldest first for steady chronology.
             eligible.sort(key=lambda x: x[1], reverse=True)
 
+            # Garbage-collect expired no-chat cache entries.
+            for k in [m for m, exp in NO_CHAT_CACHE.items() if exp <= now]:
+                NO_CHAT_CACHE.pop(k, None)
+
             sent_this_tick = 0
+            chat_checks = 0
+            cache_skips = 0
+
             for c, age_secs in eligible:
                 if sent_this_tick >= MAX_PER_SCAN:
                     break
 
                 mint = c["mint"]
+
+                # Skip recheck if we recently saw "no chat yet".
+                if mint in NO_CHAT_CACHE:
+                    cache_skips += 1
+                    continue
+
                 chat_url = get_invite_link(mint)
+                chat_checks += 1
+
                 if REQUIRE_CHAT and not chat_url:
+                    NO_CHAT_CACHE[mint] = now + NO_CHAT_TTL
                     continue
 
                 msg = build_message(c, age_secs, chat_url)
@@ -302,16 +332,19 @@ def bot_loop():
                 symbol = c.get("symbol", "")
                 print(
                     f"📨 {name} ({symbol}) | MC={format_mc(c.get('usd_market_cap') or 0)} "
-                    f"| age={format_age(age_secs)} | chat={'yes' if chat_url else 'no'}",
+                    f"| age={format_age(age_secs)} | chat=yes",
                     flush=True,
                 )
 
                 if send_telegram(msg):
                     remember_sent(mint)
+                    NO_CHAT_CACHE.pop(mint, None)
                     sent_this_tick += 1
 
             print(
-                f"👀 Scanned {len(coins)} | eligible {len(eligible)} | sent {sent_this_tick} | tracked {len(SENT)}",
+                f"👀 Scanned {len(coins)} | eligible {len(eligible)} | "
+                f"chat-checks {chat_checks} | cache-skips {cache_skips} | "
+                f"sent {sent_this_tick} | tracked {len(SENT)} | no-chat-cache {len(NO_CHAT_CACHE)}",
                 flush=True,
             )
 
