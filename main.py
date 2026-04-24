@@ -242,8 +242,6 @@ def build_message(coin, age_secs, chat_url):
     symbol = coin.get("symbol", "")
     reply_count = coin.get("reply_count") or 0
     usd_mc = coin.get("usd_market_cap") or 0
-    mint = coin.get("mint")
-    coin_url = f"https://pump.fun/coin/{mint}"
 
     lines = [
         f"🆕 {name} (${symbol})",
@@ -251,10 +249,8 @@ def build_message(coin, age_secs, chat_url):
         f"⏱ Age: {format_age(age_secs)}",
         f"💬 Replies: {reply_count}",
         "",
-        f"🔗 {coin_url}",
+        f"💭 {chat_url}",
     ]
-    if chat_url:
-        lines.append(f"💭 Chat: {chat_url}")
     return "\n".join(lines)
 
 
