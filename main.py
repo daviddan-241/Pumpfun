@@ -45,7 +45,12 @@ ANNOUNCE_STARTUP = os.environ.get("ANNOUNCE_STARTUP", "1") == "1"
 
 # Persist sent mints to disk so restarts don't re-send the same coins.
 SENT_FILE = os.environ.get("SENT_FILE", "sent_mints.json")
-SENT_MAX = int(os.environ.get("SENT_MAX", "5000"))
+# Bounded so dedupe state always fits in a single Telegram message (~4096 chars).
+# 44-char mints + JSON overhead → ~80 mints fits comfortably.
+SENT_MAX = int(os.environ.get("SENT_MAX", "80"))
+
+# Marker that lets us recognize our own dedupe message in the channel's pinned slot.
+STATE_MARKER = "__PUMPFUN_BOT_DEDUPE_STATE__"
 
 app = Flask(__name__)
 
@@ -54,6 +59,11 @@ SENT = set()
 SENT_ORDER = deque(maxlen=SENT_MAX)
 SENT_LOCK = Lock()
 
+# Telegram message ID of the pinned dedupe state message (None = not yet created).
+state_msg_id = None
+# Whether the bot has admin/pin perms in the channel. Detected at startup.
+remote_persistence_ok = True
+
 # Cache "no chat yet" lookups so we don't recheck the same mint every 8s.
 # mint -> unix_timestamp_when_we_can_recheck
 NO_CHAT_CACHE = {}
@@ -61,23 +71,45 @@ NO_CHAT_CACHE = {}
 last_send_time = 0.0
 
 
-def load_sent():
-    """Load previously-sent mints from disk so restarts don't re-send."""
+def _state_text():
+    """Render the dedupe state as a single Telegram message body."""
+    payload = json.dumps(list(SENT_ORDER), separators=(",", ":"))
+    return f"{STATE_MARKER}\n{payload}"
+
+
+def _parse_state_text(text):
+    """Parse a state message body back into a list of mints."""
+    if not text or not text.startswith(STATE_MARKER):
+        return None
+    try:
+        body = text[len(STATE_MARKER):].strip()
+        data = json.loads(body)
+        if isinstance(data, list):
+            return [m for m in data if isinstance(m, str)]
+    except Exception:
+        return None
+    return None
+
+
+def load_sent_from_disk():
+    """Local cache — fast in normal operation but wiped on Render restarts."""
     try:
         with open(SENT_FILE, "r") as f:
             mints = json.load(f)
         if isinstance(mints, list):
             for m in mints[-SENT_MAX:]:
-                SENT.add(m)
-                SENT_ORDER.append(m)
-            print(f"📂 Loaded {len(SENT)} previously-sent mints from {SENT_FILE}", flush=True)
+                if m not in SENT:
+                    SENT.add(m)
+                    SENT_ORDER.append(m)
+            return len(mints)
     except FileNotFoundError:
-        pass
+        return 0
     except Exception as e:
         print(f"⚠️ Could not load {SENT_FILE}: {e}", flush=True)
+    return 0
 
 
-def save_sent():
+def save_sent_to_disk():
     """Persist the dedupe list to disk (atomic write)."""
     try:
         tmp = SENT_FILE + ".tmp"
@@ -86,6 +118,123 @@ def save_sent():
         os.replace(tmp, SENT_FILE)
     except Exception as e:
         print(f"⚠️ Could not save {SENT_FILE}: {e}", flush=True)
+
+
+def load_sent_from_telegram():
+    """
+    Restore dedupe state from the channel's pinned message.
+    Returns the number of mints loaded, or -1 if the bot can't access the chat
+    (no admin / wrong CHAT_ID / token bad).
+    """
+    global state_msg_id
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getChat"
+        r = requests.get(url, params={"chat_id": CHAT_ID}, timeout=15)
+        if r.status_code != 200:
+            print(f"⚠️ getChat failed: {r.status_code} {r.text[:200]}", flush=True)
+            return -1
+        result = r.json().get("result", {})
+        pinned = result.get("pinned_message")
+        if not pinned:
+            return 0
+        text = pinned.get("text") or pinned.get("caption") or ""
+        mints = _parse_state_text(text)
+        if mints is None:
+            print("ℹ️ Pinned message is not our dedupe state — leaving it alone.", flush=True)
+            return 0
+        state_msg_id = pinned.get("message_id")
+        for m in mints[-SENT_MAX:]:
+            if m not in SENT:
+                SENT.add(m)
+                SENT_ORDER.append(m)
+        return len(mints)
+    except Exception as e:
+        print(f"⚠️ load_sent_from_telegram error: {e}", flush=True)
+        return -1
+
+
+def save_sent_to_telegram():
+    """
+    Edit (or create + pin) the dedupe state message in the channel so the
+    state survives Render restarts and free-tier disk wipes.
+    """
+    global state_msg_id, remote_persistence_ok
+    if not remote_persistence_ok:
+        return
+
+    text = _state_text()
+
+    # Try editing the existing pinned state message first.
+    if state_msg_id is not None:
+        try:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
+            r = requests.post(
+                url,
+                data={
+                    "chat_id": CHAT_ID,
+                    "message_id": state_msg_id,
+                    "text": text,
+                    "disable_web_page_preview": "true",
+                },
+                timeout=15,
+            )
+            if r.status_code == 200:
+                return
+            # "message is not modified" = same content, fine.
+            if "not modified" in r.text:
+                return
+            # Anything else: fall through to recreating the state msg.
+            print(f"ℹ️ editMessageText failed ({r.status_code}); will re-create state msg", flush=True)
+            state_msg_id = None
+        except Exception as e:
+            print(f"⚠️ editMessageText error: {e}", flush=True)
+            state_msg_id = None
+
+    # Create + pin a new state message.
+    try:
+        send_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        sr = requests.post(
+            send_url,
+            data={
+                "chat_id": CHAT_ID,
+                "text": text,
+                "disable_notification": "true",
+                "disable_web_page_preview": "true",
+            },
+            timeout=15,
+        )
+        if sr.status_code != 200:
+            print(f"⚠️ sendMessage(state) failed: {sr.text[:200]}", flush=True)
+            remote_persistence_ok = False
+            return
+        new_id = sr.json().get("result", {}).get("message_id")
+        if not new_id:
+            return
+        state_msg_id = new_id
+
+        pin_url = f"https://api.telegram.org/bot{BOT_TOKEN}/pinChatMessage"
+        pr = requests.post(
+            pin_url,
+            data={
+                "chat_id": CHAT_ID,
+                "message_id": new_id,
+                "disable_notification": "true",
+            },
+            timeout=15,
+        )
+        if pr.status_code != 200:
+            # Pinning failed — bot likely lacks pin permission. Disable remote
+            # persistence so we don't spam the channel with extra state msgs.
+            print(
+                f"⚠️ pinChatMessage failed ({pr.status_code}): {pr.text[:200]}\n"
+                "   → Make the bot a channel admin with 'Pin messages' permission "
+                "for restart-proof dedupe.",
+                flush=True,
+            )
+            remote_persistence_ok = False
+    except Exception as e:
+        print(f"⚠️ save_sent_to_telegram error: {e}", flush=True)
+        remote_persistence_ok = False
 
 api_session = requests.Session()
 api_session.headers.update({
@@ -251,7 +400,9 @@ def remember_sent(mint):
             SENT.discard(evicted)
         SENT_ORDER.append(mint)
         SENT.add(mint)
-        save_sent()
+        save_sent_to_disk()
+    # Telegram update happens outside the lock — network call shouldn't block scans.
+    save_sent_to_telegram()
 
 
 def format_mc(usd_mc):
@@ -391,7 +542,22 @@ def bot_loop():
 if __name__ == "__main__":
     print("🔥 SYSTEM STARTING", flush=True)
 
-    load_sent()
+    # 1) Local cache (fast, but wiped on Render restarts)
+    n_disk = load_sent_from_disk()
+    if n_disk:
+        print(f"📂 Loaded {n_disk} mints from disk cache ({SENT_FILE})", flush=True)
+
+    # 2) Restart-proof source of truth: pinned dedupe message in the channel
+    n_remote = load_sent_from_telegram()
+    if n_remote > 0:
+        print(f"☁️ Loaded {n_remote} mints from pinned Telegram state msg", flush=True)
+    elif n_remote == 0:
+        print("☁️ No pinned dedupe state yet — will create one on first send", flush=True)
+    else:
+        print("☁️ Telegram dedupe disabled (couldn't read channel state)", flush=True)
+        remote_persistence_ok = False
+
+    print(f"🧠 Total tracked mints at startup: {len(SENT)}", flush=True)
 
     Thread(target=run_flask, daemon=True).start()
     time.sleep(2)
