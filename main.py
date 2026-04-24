@@ -1,9 +1,10 @@
 import os
+import json
 import requests
 import time
 from collections import deque
+from threading import Lock, Thread
 from flask import Flask
-from threading import Thread
 
 # ================= CONFIG =================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8768676919:AAFbHfcNAU_x899JeIIiduOBKEdj1xHw404")
@@ -42,17 +43,49 @@ PING_INTERVAL = int(os.environ.get("PING_INTERVAL", "240"))
 # Send the "bot is live" message on startup.
 ANNOUNCE_STARTUP = os.environ.get("ANNOUNCE_STARTUP", "1") == "1"
 
+# Persist sent mints to disk so restarts don't re-send the same coins.
+SENT_FILE = os.environ.get("SENT_FILE", "sent_mints.json")
+SENT_MAX = int(os.environ.get("SENT_MAX", "5000"))
+
 app = Flask(__name__)
 
 # Cap the dedupe set so memory stays bounded over long runs.
 SENT = set()
-SENT_ORDER = deque(maxlen=5000)
+SENT_ORDER = deque(maxlen=SENT_MAX)
+SENT_LOCK = Lock()
 
 # Cache "no chat yet" lookups so we don't recheck the same mint every 8s.
 # mint -> unix_timestamp_when_we_can_recheck
 NO_CHAT_CACHE = {}
 
 last_send_time = 0.0
+
+
+def load_sent():
+    """Load previously-sent mints from disk so restarts don't re-send."""
+    try:
+        with open(SENT_FILE, "r") as f:
+            mints = json.load(f)
+        if isinstance(mints, list):
+            for m in mints[-SENT_MAX:]:
+                SENT.add(m)
+                SENT_ORDER.append(m)
+            print(f"📂 Loaded {len(SENT)} previously-sent mints from {SENT_FILE}", flush=True)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"⚠️ Could not load {SENT_FILE}: {e}", flush=True)
+
+
+def save_sent():
+    """Persist the dedupe list to disk (atomic write)."""
+    try:
+        tmp = SENT_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(list(SENT_ORDER), f)
+        os.replace(tmp, SENT_FILE)
+    except Exception as e:
+        print(f"⚠️ Could not save {SENT_FILE}: {e}", flush=True)
 
 api_session = requests.Session()
 api_session.headers.update({
@@ -210,16 +243,15 @@ def get_invite_link(mint):
 
 # ================= HELPERS =================
 def remember_sent(mint):
-    if len(SENT_ORDER) == SENT_ORDER.maxlen and SENT_ORDER:
-        old = SENT_ORDER[0]  # will be evicted by the next append
-        # Defer eviction: when deque hits maxlen, the leftmost is dropped on append.
-        # Mirror that here.
-    SENT_ORDER.append(mint)
-    SENT.add(mint)
-    # Trim SENT to match deque contents to avoid unbounded growth.
-    if len(SENT) > SENT_ORDER.maxlen:
-        keep = set(SENT_ORDER)
-        SENT.intersection_update(keep)
+    with SENT_LOCK:
+        # When the deque hits maxlen, the leftmost is auto-evicted on append.
+        # Mirror that eviction in the SENT set so memory stays bounded.
+        if len(SENT_ORDER) == SENT_ORDER.maxlen and SENT_ORDER:
+            evicted = SENT_ORDER[0]
+            SENT.discard(evicted)
+        SENT_ORDER.append(mint)
+        SENT.add(mint)
+        save_sent()
 
 
 def format_mc(usd_mc):
@@ -246,6 +278,8 @@ def build_message(coin, age_secs, chat_url):
     coin_url = f"https://pump.fun/coin/{mint}"
 
     lines = [
+        "✨ New active coin found",
+        "",
         f"🆕 {name} (${symbol})",
         f"💰 MC: {format_mc(usd_mc)}",
         f"⏱ Age: {format_age(age_secs)}",
@@ -356,6 +390,8 @@ def bot_loop():
 # ================= START =================
 if __name__ == "__main__":
     print("🔥 SYSTEM STARTING", flush=True)
+
+    load_sent()
 
     Thread(target=run_flask, daemon=True).start()
     time.sleep(2)
