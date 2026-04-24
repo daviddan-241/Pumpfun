@@ -57,6 +57,9 @@ app = Flask(__name__)
 # Cap the dedupe set so memory stays bounded over long runs.
 SENT = set()
 SENT_ORDER = deque(maxlen=SENT_MAX)
+# Same-name copycat suppression: blocks repeats of the same (name, symbol).
+SENT_NAMES = set()
+SENT_NAMES_ORDER = deque(maxlen=SENT_MAX)
 SENT_LOCK = Lock()
 
 # Telegram message ID of the pinned dedupe state message (None = not yet created).
@@ -73,35 +76,62 @@ last_send_time = 0.0
 
 def _state_text():
     """Render the dedupe state as a single Telegram message body."""
-    payload = json.dumps(list(SENT_ORDER), separators=(",", ":"))
+    payload = json.dumps(
+        {"mints": list(SENT_ORDER), "names": list(SENT_NAMES_ORDER)},
+        separators=(",", ":"),
+    )
     return f"{STATE_MARKER}\n{payload}"
 
 
 def _parse_state_text(text):
-    """Parse a state message body back into a list of mints."""
+    """
+    Parse a state message body. Returns (mints, names) tuple, or (None, None)
+    if the text isn't ours. Backward-compatible with the old list-only format.
+    """
     if not text or not text.startswith(STATE_MARKER):
-        return None
+        return None, None
     try:
         body = text[len(STATE_MARKER):].strip()
         data = json.loads(body)
         if isinstance(data, list):
-            return [m for m in data if isinstance(m, str)]
+            return [m for m in data if isinstance(m, str)], []
+        if isinstance(data, dict):
+            mints = [m for m in data.get("mints", []) if isinstance(m, str)]
+            names = [n for n in data.get("names", []) if isinstance(n, str)]
+            return mints, names
     except Exception:
-        return None
-    return None
+        return None, None
+    return None, None
+
+
+def _name_key(coin):
+    """Stable lower-cased (name, symbol) key for copycat detection."""
+    name = (coin.get("name") or "").strip().lower()
+    sym = (coin.get("symbol") or "").strip().lower()
+    return f"{name}|{sym}"
 
 
 def load_sent_from_disk():
     """Local cache — fast in normal operation but wiped on Render restarts."""
     try:
         with open(SENT_FILE, "r") as f:
-            mints = json.load(f)
-        if isinstance(mints, list):
-            for m in mints[-SENT_MAX:]:
-                if m not in SENT:
-                    SENT.add(m)
-                    SENT_ORDER.append(m)
-            return len(mints)
+            data = json.load(f)
+        if isinstance(data, list):
+            mints, names = data, []
+        elif isinstance(data, dict):
+            mints = data.get("mints", [])
+            names = data.get("names", [])
+        else:
+            return 0
+        for m in mints[-SENT_MAX:]:
+            if m not in SENT:
+                SENT.add(m)
+                SENT_ORDER.append(m)
+        for n in names[-SENT_MAX:]:
+            if n not in SENT_NAMES:
+                SENT_NAMES.add(n)
+                SENT_NAMES_ORDER.append(n)
+        return len(mints)
     except FileNotFoundError:
         return 0
     except Exception as e:
@@ -114,7 +144,10 @@ def save_sent_to_disk():
     try:
         tmp = SENT_FILE + ".tmp"
         with open(tmp, "w") as f:
-            json.dump(list(SENT_ORDER), f)
+            json.dump(
+                {"mints": list(SENT_ORDER), "names": list(SENT_NAMES_ORDER)},
+                f,
+            )
         os.replace(tmp, SENT_FILE)
     except Exception as e:
         print(f"⚠️ Could not save {SENT_FILE}: {e}", flush=True)
@@ -138,19 +171,55 @@ def load_sent_from_telegram():
         if not pinned:
             return 0
         text = pinned.get("text") or pinned.get("caption") or ""
-        mints = _parse_state_text(text)
+        mints, names = _parse_state_text(text)
         if mints is None:
             print("ℹ️ Pinned message is not our dedupe state — leaving it alone.", flush=True)
             return 0
         state_msg_id = pinned.get("message_id")
-        for m in mints[-SENT_MAX:]:
-            if m not in SENT:
-                SENT.add(m)
-                SENT_ORDER.append(m)
+        with SENT_LOCK:
+            for m in mints[-SENT_MAX:]:
+                if m not in SENT:
+                    SENT.add(m)
+                    SENT_ORDER.append(m)
+            for n in (names or [])[-SENT_MAX:]:
+                if n not in SENT_NAMES:
+                    SENT_NAMES.add(n)
+                    SENT_NAMES_ORDER.append(n)
         return len(mints)
     except Exception as e:
         print(f"⚠️ load_sent_from_telegram error: {e}", flush=True)
         return -1
+
+
+def refresh_state_from_telegram():
+    """
+    Lightweight pre-send refresh. Pulls the latest pinned dedupe message so
+    multiple bot instances (Replit + Render running together) don't double-send.
+    """
+    if not remote_persistence_ok:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getChat"
+        r = requests.get(url, params={"chat_id": CHAT_ID}, timeout=10)
+        if r.status_code != 200:
+            return
+        pinned = r.json().get("result", {}).get("pinned_message") or {}
+        text = pinned.get("text") or ""
+        mints, names = _parse_state_text(text)
+        if mints is None:
+            return
+        with SENT_LOCK:
+            for m in mints[-SENT_MAX:]:
+                if m not in SENT:
+                    SENT.add(m)
+                    SENT_ORDER.append(m)
+            for n in (names or [])[-SENT_MAX:]:
+                if n not in SENT_NAMES:
+                    SENT_NAMES.add(n)
+                    SENT_NAMES_ORDER.append(n)
+    except Exception:
+        # Silent — this is just an optimization to avoid duplicates.
+        pass
 
 
 def save_sent_to_telegram():
@@ -391,7 +460,7 @@ def get_invite_link(mint):
 
 
 # ================= HELPERS =================
-def remember_sent(mint):
+def remember_sent(mint, name_key=None):
     with SENT_LOCK:
         # When the deque hits maxlen, the leftmost is auto-evicted on append.
         # Mirror that eviction in the SENT set so memory stays bounded.
@@ -400,6 +469,16 @@ def remember_sent(mint):
             SENT.discard(evicted)
         SENT_ORDER.append(mint)
         SENT.add(mint)
+
+        if name_key:
+            if (
+                len(SENT_NAMES_ORDER) == SENT_NAMES_ORDER.maxlen
+                and SENT_NAMES_ORDER
+            ):
+                SENT_NAMES.discard(SENT_NAMES_ORDER[0])
+            SENT_NAMES_ORDER.append(name_key)
+            SENT_NAMES.add(name_key)
+
         save_sent_to_disk()
     # Telegram update happens outside the lock — network call shouldn't block scans.
     save_sent_to_telegram()
@@ -491,6 +570,7 @@ def bot_loop():
             sent_this_tick = 0
             chat_checks = 0
             cache_skips = 0
+            name_skips = 0
 
             for c, age_secs in eligible:
                 if sent_this_tick >= MAX_PER_SCAN:
@@ -503,11 +583,29 @@ def bot_loop():
                     cache_skips += 1
                     continue
 
+                # Skip same-name copycat coins (different mint, same name+symbol).
+                nkey = _name_key(c)
+                if nkey in SENT_NAMES:
+                    name_skips += 1
+                    continue
+
                 chat_url = get_invite_link(mint)
                 chat_checks += 1
 
                 if REQUIRE_CHAT and not chat_url:
                     NO_CHAT_CACHE[mint] = now + NO_CHAT_TTL
+                    continue
+
+                # CRITICAL: refresh state from the pinned Telegram message right
+                # before sending so a parallel bot instance can't double-fire
+                # the same coin. This is the cross-instance lock.
+                refresh_state_from_telegram()
+                if mint in SENT or nkey in SENT_NAMES:
+                    print(
+                        f"⏭️ {c.get('name')} ({c.get('symbol')}) — "
+                        f"already sent by another instance",
+                        flush=True,
+                    )
                     continue
 
                 msg = build_message(c, age_secs, chat_url)
@@ -520,14 +618,16 @@ def bot_loop():
                 )
 
                 if send_telegram(msg):
-                    remember_sent(mint)
+                    remember_sent(mint, name_key=nkey)
                     NO_CHAT_CACHE.pop(mint, None)
                     sent_this_tick += 1
 
             print(
                 f"👀 Scanned {len(coins)} | eligible {len(eligible)} | "
                 f"chat-checks {chat_checks} | cache-skips {cache_skips} | "
-                f"sent {sent_this_tick} | tracked {len(SENT)} | no-chat-cache {len(NO_CHAT_CACHE)}",
+                f"name-skips {name_skips} | sent {sent_this_tick} | "
+                f"tracked {len(SENT)} | names {len(SENT_NAMES)} | "
+                f"no-chat-cache {len(NO_CHAT_CACHE)}",
                 flush=True,
             )
 
@@ -557,7 +657,10 @@ if __name__ == "__main__":
         print("☁️ Telegram dedupe disabled (couldn't read channel state)", flush=True)
         remote_persistence_ok = False
 
-    print(f"🧠 Total tracked mints at startup: {len(SENT)}", flush=True)
+    print(
+        f"🧠 Total tracked at startup: {len(SENT)} mints, {len(SENT_NAMES)} names",
+        flush=True,
+    )
 
     Thread(target=run_flask, daemon=True).start()
     time.sleep(2)
