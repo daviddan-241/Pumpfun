@@ -7,7 +7,7 @@ from threading import Lock, Thread
 from flask import Flask
 
 # ================= CONFIG =================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8768676919:AAFbHfcNAU_x899JeIIiduOBKEdj1xHw404")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8644675553:AAF7cMl_dZsGh1zPfVXLFQJhwqr-KYNP22g")
 CHAT_ID = os.environ.get("CHAT_ID", "-1003908847150")
 
 # Only consider coins newer than this many seconds. Wider window = more
